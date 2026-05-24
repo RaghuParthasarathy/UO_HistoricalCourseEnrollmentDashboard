@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.streamlit/secrets.toml
+.DS_Store
+.idea/
+.vscode/
+# Raw scraped data lives outside this repo; only the prepared files in data/
+# should be tracked.
+uo_schedules/
