@@ -497,10 +497,10 @@ catalog = load_catalog()
 if "selected" not in st.session_state:
     st.session_state.selected = []  # list of (subject, course_number) tuples
 
-st.title("UO Course Enrollment Dashboard")
+st.title("UO Historical Course Enrollment Dashboard")
 st.caption(
-    "For plotting historical enrollment data for University of Oregon courses, 1990 – present.\n"
-    "Design: Raghuveer Parthasarathy. Code: Claude Opus 4.7. Version 1: May 24, 2026.\n"
+    "For plotting historical enrollment data for University of Oregon courses, 1990 – present.  \n"
+    "Design: Raghuveer Parthasarathy. Code: Claude Opus 4.7. Version 1: May 24, 2026.  \n"
     "Data from UO Course Schedules and 2025-26 course catalog (descriptions); saved locally."
 )
 
