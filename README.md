@@ -33,7 +33,13 @@ trying to fix them:
 - **Course-number changes are not reconciled.** If a course was renumbered
   partway through its history (e.g. PHYS 101 → PHYS 121), each number is
   treated as a separate course. The resulting time series will be jagged.
-  Plot both numbers if you suspect a renumbering.
+  Plot both numbers if you suspect a renumbering. *Exception:* the
+  "Combine '…Z' transferable variants" option (on by default) merges
+  courses that differ only by a trailing "Z" — UO has been appending the
+  Z suffix to many introductory courses (CH 221 → CH 221Z, BI 221 → BI
+  221Z, etc.) to mark statewide-transferable equivalents, and these are
+  effectively the same course. Other letter suffixes (H = honors, L =
+  lab, M, N) are always kept separate.
 - **Subject-code changes are not reconciled.** Same caveat: if a department
   changed its subject code, each code is a separate series.
 - **Cross-listed courses are not merged.** A course offered under two

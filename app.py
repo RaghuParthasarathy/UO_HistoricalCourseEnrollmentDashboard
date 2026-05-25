@@ -60,6 +60,15 @@ MARKER_SYMBOLS = [
 def load_enrollment() -> pd.DataFrame:
     df = pd.read_parquet(ENROLLMENT_PARQUET)
 
+    # Course_Number_Norm strips a single trailing "Z" so that courses like
+    # "CH 221" and "CH 221Z" (the new state-transferable variant) can be
+    # combined when the user enables the merge option. Other suffixes
+    # (H = honors, L = lab, M, N) are preserved because they mark distinct
+    # offerings.
+    df["Course_Number_Norm"] = df["Course_Number"].str.replace(
+        r"Z$", "", regex=True
+    )
+
     # Derive year/quarter/x-axis columns.
     df["academic_year"] = df["Term_Code"].str[:4].astype(int)
     df["quarter_code"] = df["Term_Code"].str[4:6]
@@ -78,12 +87,18 @@ def load_enrollment() -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_catalog() -> pd.DataFrame:
     df = pd.read_csv(CATALOG_CSV, dtype=str)
+    df["Course_Number_Norm"] = df["Course_Number"].str.replace(
+        r"Z$", "", regex=True
+    )
     return df
 
 
 @st.cache_data(show_spinner=False)
-def subject_course_index(enrollment: pd.DataFrame) -> dict[str, list[str]]:
-    """{ subject: [course_number, ...] } with courses naturally sorted."""
+def subject_course_index(enrollment: pd.DataFrame,
+                         num_col: str = "Course_Number") -> dict[str, list[str]]:
+    """{ subject: [course_number, ...] } with courses naturally sorted.
+
+    Pass num_col='Course_Number_Norm' to collapse Z-suffix variants."""
     import re
     def natural_key(s: str):
         # Sort "101", "101H", "199", "199A", "201" sensibly.
@@ -91,7 +106,7 @@ def subject_course_index(enrollment: pd.DataFrame) -> dict[str, list[str]]:
                 for t in re.split(r"(\d+)", s)]
     out: dict[str, list[str]] = {}
     for subj, group in enrollment.groupby("Subject", observed=True):
-        out[str(subj)] = sorted(group["Course_Number"].unique(),
+        out[str(subj)] = sorted(group[num_col].unique(),
                                 key=natural_key)
     return out
 
@@ -127,6 +142,7 @@ def filter_and_aggregate(
     year_start: int,
     year_end: int,
     exclude_summer: bool,
+    merge_z: bool = False,
 ) -> pd.DataFrame:
     """Apply all the user's filters and produce plotting-ready rows.
 
@@ -139,10 +155,27 @@ def filter_and_aggregate(
             series_key=pd.Series(dtype=str), label=pd.Series(dtype=str)
         )
 
-    # Subset to selected (Subject, Course_Number) pairs.
-    keys = pd.MultiIndex.from_tuples(selected, names=["Subject", "Course_Number"])
-    df = enrollment.set_index(["Subject", "Course_Number"])
+    # When merging Z-variants we match on the normalized column and
+    # normalize the user's selected pairs so toggling the option doesn't
+    # invalidate the selection list.
+    import re
+    num_col = "Course_Number_Norm" if merge_z else "Course_Number"
+    if merge_z:
+        selected_lookup = [(s, re.sub(r"Z$", "", n)) for s, n in selected]
+    else:
+        selected_lookup = list(selected)
+
+    # Subset to selected (Subject, course_number) pairs.
+    keys = pd.MultiIndex.from_tuples(selected_lookup,
+                                     names=["Subject", num_col])
+    df = enrollment.set_index(["Subject", num_col])
     df = df.loc[df.index.intersection(keys)].reset_index()
+
+    # In merge mode, replace Course_Number with the normalized form so that
+    # all downstream groupings (which key on Course_Number) collapse the
+    # Z-variants into a single course identity.
+    if merge_z:
+        df["Course_Number"] = df["Course_Number_Norm"]
 
     # Year range and summer.
     df = df[(df["academic_year"] >= year_start) &
@@ -312,26 +345,33 @@ def build_plot(plot_df: pd.DataFrame, normalize: bool,
             ))
 
     elif not plot_df.empty and annual_mode:
-        # AY-summed: one horizontal segment per (series, AY). Insert NaN
-        # between segments so they don't visually connect across AYs.
+        # AY-summed: one horizontal segment per (series, AY). Consecutive AYs
+        # are connected by a short link from (end_n, val_n) to (start_{n+1},
+        # val_{n+1}) so the eye can follow each course as a single curve.
+        # If a year is missing entirely for a series (course not offered),
+        # we insert a NaN break so the gap is visible.
         y_hover = "Annual total: %{y:.2f}" if normalize else "Annual total: %{y}"
         for label, group in plot_df.groupby("series_key", sort=False, observed=True):
             color = stable_color(label)
             symbol = stable_marker(label)
             display = group["label"].iloc[0]
             xs, ys, hover_text, custom = [], [], [], []
+            prev_ay = None
             for _, row in group.iterrows():
-                # Two endpoints + a break.
-                xs.extend([row["x_start"], row["x_end"], None])
-                ys.extend([row["Enrollment"], row["Enrollment"], None])
                 ay = int(row["academic_year"])
+                if prev_ay is not None and ay - prev_ay > 1:
+                    # Insert a real gap for missing years.
+                    xs.append(None); ys.append(None)
+                    hover_text.append(""); custom.append((0, ""))
+                xs.extend([row["x_start"], row["x_end"]])
+                ys.extend([row["Enrollment"], row["Enrollment"]])
                 ay_label = f"AY {ay}-{(ay + 1) % 100:02d}"
-                hover_text.extend([ay_label, ay_label, ""])
+                hover_text.extend([ay_label, ay_label])
                 custom.extend([
                     (int(row["n_terms"]), row["Format_Norm"]),
                     (int(row["n_terms"]), row["Format_Norm"]),
-                    (0, ""),
                 ])
+                prev_ay = ay
             fig.add_trace(go.Scatter(
                 x=xs, y=ys,
                 mode="lines+markers",
@@ -393,12 +433,17 @@ def build_plot(plot_df: pd.DataFrame, normalize: bool,
 
 
 def render_catalog_descriptions(catalog: pd.DataFrame,
-                                selected: list[tuple[str, str]]) -> None:
-    cat_idx = catalog.set_index(["Subject", "Course_Number"])
+                                selected: list[tuple[str, str]],
+                                merge_z: bool = False) -> None:
+    import re
+    num_col = "Course_Number_Norm" if merge_z else "Course_Number"
+    cat_idx = catalog.set_index(["Subject", num_col])
     for subj, num in selected:
+        # Display heading uses whatever the user originally added.
         st.markdown(f"### {subj} {num}")
+        lookup_num = re.sub(r"Z$", "", num) if merge_z else num
         try:
-            row = cat_idx.loc[(subj, num)]
+            row = cat_idx.loc[(subj, lookup_num)]
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
             title = row.get("Title", "")
@@ -447,7 +492,6 @@ if not ENROLLMENT_PARQUET.exists() or not CATALOG_CSV.exists():
 
 enrollment = load_enrollment()
 catalog = load_catalog()
-subj_idx = subject_course_index(enrollment)
 
 # Session state for the selected-courses list.
 if "selected" not in st.session_state:
@@ -455,15 +499,27 @@ if "selected" not in st.session_state:
 
 st.title("UO Course Enrollment Dashboard")
 st.caption(
-    "For plotting historical enrollment data for University of Oregon courses, 1990 – present.  \n"
-    "Design: Raghuveer Parthasarathy. Code: Claude Opus 4.7. Version 1: May 24, 2026.  \n"
-    "Data from UO Course Schedules and 2025-26 course catalog (descriptions); saved locally."
+    "Enrollment over time for University of Oregon courses, 1990 – present. "
+    "Data scraped from DuckWeb (enrollment) and the 2025-26 course catalog "
+    "(descriptions)."
 )
 
 tab_plot, tab_readme = st.tabs(["Dashboard", "About / README"])
 
 # --- Sidebar controls --------------------------------------------------------
 with st.sidebar:
+    merge_z = st.checkbox(
+        "Combine '…Z' transferable variants",
+        value=True,
+        help="When on, treats courses like 'CH 221' and 'CH 221Z' as the "
+             "same course (UO adds the Z suffix to mark statewide-"
+             "transferable courses). Other letter suffixes (H, L, M, N) "
+             "are always kept separate.",
+    )
+
+    num_col = "Course_Number_Norm" if merge_z else "Course_Number"
+    subj_idx = subject_course_index(enrollment, num_col)
+
     st.header("Add a course")
     all_subjects = sorted(subj_idx.keys())
     subj = st.selectbox("Subject", options=all_subjects, key="subj_pick",
@@ -486,10 +542,14 @@ with st.sidebar:
     if not st.session_state.selected:
         st.caption("None yet — pick one above.")
     else:
+        import re
         for i, (s, n) in enumerate(list(st.session_state.selected)):
+            # Display the normalized form when merge mode is on, even for
+            # entries that were added before the toggle was flipped.
+            display_n = re.sub(r"Z$", "", n) if merge_z else n
             cA, cB = st.columns([0.78, 0.22])
             with cA:
-                st.write(f"• {s} {n}")
+                st.write(f"• {s} {display_n}")
             with cB:
                 if st.button("✕", key=f"rm_{i}_{s}_{n}",
                              help="Remove this course"):
@@ -547,6 +607,7 @@ with tab_plot:
         format_mode=format_mode, aggregate=aggregate,
         year_start=year_start, year_end=year_end,
         exclude_summer=exclude_summer,
+        merge_z=merge_z,
     )
     if annual_mode:
         plot_df = annual_sum(plot_df, exclude_summer=exclude_summer)
@@ -609,7 +670,8 @@ with tab_plot:
         if 1 <= len(st.session_state.selected) <= 5:
             st.divider()
             st.subheader("2025-26 catalog descriptions")
-            render_catalog_descriptions(catalog, st.session_state.selected)
+            render_catalog_descriptions(catalog, st.session_state.selected,
+                                        merge_z=merge_z)
 
 # --- README tab --------------------------------------------------------------
 with tab_readme:
