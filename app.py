@@ -23,6 +23,7 @@ DATA_DIR = Path(__file__).parent / "data"
 ENROLLMENT_PARQUET = DATA_DIR / "enrollment.parquet"
 CATALOG_CSV = DATA_DIR / "catalog.csv"
 README_PATH = Path(__file__).parent / "README.md"
+MODIFICATIONS_CSV = Path(__file__).parent / "modifications.csv"
 
 # Quarter codes in 6-digit term codes:
 #   01 = Fall, 02 = Winter, 03 = Spring, 04 = Summer
@@ -93,21 +94,98 @@ def load_catalog() -> pd.DataFrame:
     return df
 
 
+def load_merge_rules(path: Path = MODIFICATIONS_CSV) -> dict[str, str]:
+    """Read subject-merge rules from a small CSV.
+
+    File format (no header; whitespace is stripped):
+        merge, NEW_CODE, OLD_CODE
+
+    For example:
+        merge, ERTH, GEOL     # ERTH was previously GEOL
+        merge, J, JCOM
+
+    Returns {raw_subject: canonical_subject}. The canonical for a row is
+    the *new* code; both the new and old map to it, so canonical lookup
+    is idempotent. Unknown subjects map to themselves at query time.
+
+    Not cached — the file is tiny and the user may edit it between runs.
+    """
+    if not path.exists():
+        return {}
+    rules: dict[str, str] = {}
+    import csv
+    with open(path, newline="") as f:
+        for row in csv.reader(f):
+            cells = [c.strip() for c in row]
+            cells = [c for c in cells if c]  # drop empties
+            if len(cells) < 3:
+                continue
+            if cells[0].lower() != "merge":
+                continue
+            new, old = cells[1], cells[2]
+            rules[old] = new
+            rules[new] = new
+    return rules
+
+
+def canonical_subject(subj: str, rules: dict[str, str]) -> str:
+    return rules.get(subj, subj)
+
+
+def build_subject_options(enrollment: pd.DataFrame,
+                          rules: dict[str, str]) -> list[tuple[str, str]]:
+    """Build the (display_label, canonical) pairs that populate the
+    subject dropdown.
+
+    A subject participating in a merge is shown alongside its alias(es),
+    e.g. 'ERTH (+GEOL)' and 'GEOL (+ERTH)' — both still selectable as
+    separate entries so users can find the course under either name.
+
+    Returns the list sorted alphabetically by the raw subject code so the
+    dropdown order is predictable.
+    """
+    raw_subjects = set(enrollment["Subject"].unique())
+    # Group raw subjects by their canonical form.
+    by_canonical: dict[str, list[str]] = {}
+    for s in raw_subjects:
+        c = canonical_subject(s, rules)
+        by_canonical.setdefault(c, []).append(s)
+
+    options: list[tuple[str, str]] = []
+    for canon, members in by_canonical.items():
+        if len(members) == 1:
+            options.append((members[0], canon))
+        else:
+            for s in members:
+                others = sorted(m for m in members if m != s)
+                label = f"{s} (+{', '.join(others)})"
+                options.append((label, canon))
+    options.sort(key=lambda lc: lc[0].split(" ")[0])
+    return options
+
+
 @st.cache_data(show_spinner=False)
 def subject_course_index(enrollment: pd.DataFrame,
-                         num_col: str = "Course_Number") -> dict[str, list[str]]:
-    """{ subject: [course_number, ...] } with courses naturally sorted.
+                         num_col: str = "Course_Number",
+                         rules: dict[str, str] | None = None
+                         ) -> dict[str, list[str]]:
+    """{ canonical_subject: [course_number, ...] } with courses naturally sorted.
 
-    Pass num_col='Course_Number_Norm' to collapse Z-suffix variants."""
+    Pass num_col='Course_Number_Norm' to collapse Z-suffix variants.
+    Pass `rules` to merge old/new subject codes (e.g. GEOL → ERTH); the
+    returned keys are the *canonical* subjects, with course numbers
+    drawn from the union of all merged raw subjects.
+    """
     import re
+    rules = rules or {}
     def natural_key(s: str):
         # Sort "101", "101H", "199", "199A", "201" sensibly.
         return [int(t) if t.isdigit() else t
                 for t in re.split(r"(\d+)", s)]
+    canon = enrollment["Subject"].map(lambda s: canonical_subject(s, rules))
     out: dict[str, list[str]] = {}
-    for subj, group in enrollment.groupby("Subject", observed=True):
-        out[str(subj)] = sorted(group[num_col].unique(),
-                                key=natural_key)
+    for c, group in enrollment.assign(_canon=canon).groupby("_canon", observed=True):
+        out[str(c)] = sorted(group[num_col].unique(), key=natural_key)
     return out
 
 
@@ -143,6 +221,7 @@ def filter_and_aggregate(
     year_end: int,
     exclude_summer: bool,
     merge_z: bool = False,
+    rules: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Apply all the user's filters and produce plotting-ready rows.
 
@@ -155,25 +234,44 @@ def filter_and_aggregate(
             series_key=pd.Series(dtype=str), label=pd.Series(dtype=str)
         )
 
+    rules = rules or {}
+
+    # --- Subject canonicalization (e.g. GEOL → ERTH per modifications.csv) ---
+    # We add a Subject_Canonical column on the data and convert the selected
+    # pairs to canonical form for the join. After the subset, we replace
+    # Subject with Subject_Canonical so all downstream groupings collapse
+    # the merged subjects into a single series identity.
+    enrollment_local = enrollment
+    if rules:
+        canon_map = lambda s: rules.get(s, s)
+        enrollment_local = enrollment.assign(
+            Subject_Canonical=enrollment["Subject"].map(canon_map)
+        )
+        subject_col = "Subject_Canonical"
+        selected_canon = [(canon_map(s), n) for s, n in selected]
+    else:
+        subject_col = "Subject"
+        selected_canon = list(selected)
+
     # When merging Z-variants we match on the normalized column and
     # normalize the user's selected pairs so toggling the option doesn't
     # invalidate the selection list.
     import re
     num_col = "Course_Number_Norm" if merge_z else "Course_Number"
     if merge_z:
-        selected_lookup = [(s, re.sub(r"Z$", "", n)) for s, n in selected]
+        selected_lookup = [(s, re.sub(r"Z$", "", n)) for s, n in selected_canon]
     else:
-        selected_lookup = list(selected)
+        selected_lookup = selected_canon
 
-    # Subset to selected (Subject, course_number) pairs.
+    # Subset to selected (canonical_subject, course_number) pairs.
     keys = pd.MultiIndex.from_tuples(selected_lookup,
-                                     names=["Subject", num_col])
-    df = enrollment.set_index(["Subject", num_col])
+                                     names=[subject_col, num_col])
+    df = enrollment_local.set_index([subject_col, num_col])
     df = df.loc[df.index.intersection(keys)].reset_index()
 
-    # In merge mode, replace Course_Number with the normalized form so that
-    # all downstream groupings (which key on Course_Number) collapse the
-    # Z-variants into a single course identity.
+    # Collapse merged forms into the canonical identity for grouping.
+    if rules:
+        df["Subject"] = df["Subject_Canonical"]
     if merge_z:
         df["Course_Number"] = df["Course_Number_Norm"]
 
@@ -427,6 +525,10 @@ def build_plot(plot_df: pd.DataFrame, normalize: bool,
         height=500,
         template="simple_white",
     )
+    # Anchor the y-axis at zero by default. `tozero` auto-scales the upper
+    # bound to fit the data but always includes 0 at the bottom. The user
+    # can still pan/zoom to override interactively.
+    fig.update_yaxes(rangemode="tozero")
     if normalize:
         fig.add_hline(y=1.0, line=dict(dash="dot", color="lightgray", width=1))
     return fig
@@ -434,16 +536,20 @@ def build_plot(plot_df: pd.DataFrame, normalize: bool,
 
 def render_catalog_descriptions(catalog: pd.DataFrame,
                                 selected: list[tuple[str, str]],
-                                merge_z: bool = False) -> None:
+                                merge_z: bool = False,
+                                rules: dict[str, str] | None = None) -> None:
     import re
+    rules = rules or {}
     num_col = "Course_Number_Norm" if merge_z else "Course_Number"
+    # The catalog uses current (canonical) subject codes, so we look up by
+    # canonical subject regardless of what the user originally added.
     cat_idx = catalog.set_index(["Subject", num_col])
     for subj, num in selected:
-        # Display heading uses whatever the user originally added.
-        st.markdown(f"### {subj} {num}")
+        canon_subj = rules.get(subj, subj)
+        st.markdown(f"### {canon_subj} {num}")
         lookup_num = re.sub(r"Z$", "", num) if merge_z else num
         try:
-            row = cat_idx.loc[(subj, lookup_num)]
+            row = cat_idx.loc[(canon_subj, lookup_num)]
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
             title = row.get("Title", "")
@@ -474,7 +580,7 @@ def render_catalog_descriptions(catalog: pd.DataFrame,
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="UO Historical Course Enrollment Dashboard",
+    page_title="UO Course Enrollment Dashboard",
     page_icon="📚",
     layout="wide",
 )
@@ -497,11 +603,11 @@ catalog = load_catalog()
 if "selected" not in st.session_state:
     st.session_state.selected = []  # list of (subject, course_number) tuples
 
-st.title("UO Historical Course Enrollment Dashboard")
+st.title("UO Course Enrollment Dashboard")
 st.caption(
-    "For plotting historical enrollment data for University of Oregon courses, 1990 – present.  \n"
-    "Design: Raghuveer Parthasarathy. Code: Claude Opus 4.7. Version 1: May 24, 2026.  \n"
-    "Data from UO Course Schedules and 2025-26 course catalog (descriptions); saved locally."
+    "Enrollment over time for University of Oregon courses, 1990 – present. "
+    "Data scraped from DuckWeb (enrollment) and the 2025-26 course catalog "
+    "(descriptions)."
 )
 
 tab_plot, tab_readme = st.tabs(["Dashboard", "About / README"])
@@ -517,13 +623,26 @@ with st.sidebar:
              "are always kept separate.",
     )
 
+    # Subject-merge rules from modifications.csv. Loaded fresh each rerun
+    # so edits to the file take effect without restarting the app.
+    merge_rules = load_merge_rules()
+    subject_options = build_subject_options(enrollment, merge_rules)
+    display_to_canonical = dict(subject_options)
+
     num_col = "Course_Number_Norm" if merge_z else "Course_Number"
-    subj_idx = subject_course_index(enrollment, num_col)
+    subj_idx = subject_course_index(enrollment, num_col, merge_rules)
 
     st.header("Add a course")
-    all_subjects = sorted(subj_idx.keys())
-    subj = st.selectbox("Subject", options=all_subjects, key="subj_pick",
-                        index=all_subjects.index("PHYS") if "PHYS" in all_subjects else 0)
+    # Default to PHYS if available.
+    display_labels = [d for d, _ in subject_options]
+    default_idx = next(
+        (i for i, (_, c) in enumerate(subject_options) if c == "PHYS"),
+        0,
+    )
+    subj_display = st.selectbox(
+        "Subject", options=display_labels, index=default_idx, key="subj_pick"
+    )
+    subj = display_to_canonical[subj_display]  # canonical
     nums = subj_idx.get(subj, [])
     num = st.selectbox("Course number", options=nums, key="num_pick") if nums else None
 
@@ -531,7 +650,7 @@ with st.sidebar:
     with c_add:
         if st.button("➕ Add", use_container_width=True, type="primary"):
             if num is not None:
-                pair = (subj, num)
+                pair = (subj, num)  # always stored as canonical
                 if pair not in st.session_state.selected:
                     st.session_state.selected.append(pair)
     with c_clear:
@@ -543,9 +662,20 @@ with st.sidebar:
         st.caption("None yet — pick one above.")
     else:
         import re
+        # Migrate any pre-canonicalization entries on the fly. This means
+        # toggling merge_rules behavior or updating modifications.csv mid-
+        # session won't strand old selections.
+        migrated: list[tuple[str, str]] = []
+        for s, n in st.session_state.selected:
+            cs = merge_rules.get(s, s)
+            migrated.append((cs, n))
+        # Dedup while preserving order.
+        seen: set[tuple[str, str]] = set()
+        st.session_state.selected = [
+            p for p in migrated if not (p in seen or seen.add(p))
+        ]
+
         for i, (s, n) in enumerate(list(st.session_state.selected)):
-            # Display the normalized form when merge mode is on, even for
-            # entries that were added before the toggle was flipped.
             display_n = re.sub(r"Z$", "", n) if merge_z else n
             cA, cB = st.columns([0.78, 0.22])
             with cA:
@@ -608,6 +738,7 @@ with tab_plot:
         year_start=year_start, year_end=year_end,
         exclude_summer=exclude_summer,
         merge_z=merge_z,
+        rules=merge_rules,
     )
     if annual_mode:
         plot_df = annual_sum(plot_df, exclude_summer=exclude_summer)
@@ -671,7 +802,7 @@ with tab_plot:
             st.divider()
             st.subheader("2025-26 catalog descriptions")
             render_catalog_descriptions(catalog, st.session_state.selected,
-                                        merge_z=merge_z)
+                                        merge_z=merge_z, rules=merge_rules)
 
 # --- README tab --------------------------------------------------------------
 with tab_readme:
