@@ -137,29 +137,43 @@ def build_subject_options(enrollment: pd.DataFrame,
     """Build the (display_label, canonical) pairs that populate the
     subject dropdown.
 
-    A subject participating in a merge is shown alongside its alias(es),
-    e.g. 'ERTH (+GEOL)' and 'GEOL (+ERTH)' — both still selectable as
-    separate entries so users can find the course under either name.
+    Every alias declared in `modifications.csv` shows up as its own
+    dropdown entry — annotated with the other aliases — *as long as the
+    canonical has any data*. So when GEOL was renamed to ERTH and the
+    current scrape only contains GEOL rows, we still show both
+    `GEOL (+ERTH)` and `ERTH (+GEOL)` so users can find the course
+    under either name.
 
-    Returns the list sorted alphabetically by the raw subject code so the
-    dropdown order is predictable.
+    Returns the list sorted alphabetically by the raw subject code so
+    the dropdown order is predictable.
     """
-    raw_subjects = set(enrollment["Subject"].unique())
-    # Group raw subjects by their canonical form.
-    by_canonical: dict[str, list[str]] = {}
-    for s in raw_subjects:
-        c = canonical_subject(s, rules)
-        by_canonical.setdefault(c, []).append(s)
+    raw_subjects_in_data = set(enrollment["Subject"].unique())
+    # Set of canonicals that have any data at all.
+    canonical_with_data = {canonical_subject(s, rules) for s in raw_subjects_in_data}
+
+    # Aliases per canonical, taken from the rules table (not from data),
+    # so a freshly renamed subject still shows both forms in the dropdown.
+    canonical_to_aliases: dict[str, set[str]] = {}
+    for raw, canon in rules.items():
+        canonical_to_aliases.setdefault(canon, set()).add(raw)
 
     options: list[tuple[str, str]] = []
-    for canon, members in by_canonical.items():
-        if len(members) == 1:
-            options.append((members[0], canon))
-        else:
-            for s in members:
-                others = sorted(m for m in members if m != s)
+    seen: set[str] = set()
+    for canon in canonical_with_data:
+        aliases = canonical_to_aliases.get(canon)
+        if aliases:
+            for s in sorted(aliases):
+                if s in seen:
+                    continue
+                seen.add(s)
+                others = sorted(a for a in aliases if a != s)
                 label = f"{s} (+{', '.join(others)})"
                 options.append((label, canon))
+        else:
+            # No merge rule applies: a plain subject from the data.
+            if canon not in seen:
+                seen.add(canon)
+                options.append((canon, canon))
     options.sort(key=lambda lc: lc[0].split(" ")[0])
     return options
 
